@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shutil
 import hashlib
 import secrets
 import time
@@ -38,7 +39,7 @@ class QueueHandler(logging.Handler):
             pass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("Luffy-Gateway")
+logger = logging.getLogger("sLv-Gateway")
 
 q_handler = QueueHandler()
 q_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
@@ -46,15 +47,20 @@ logger.addHandler(q_handler)
 logging.getLogger("uvicorn.error").addHandler(q_handler)
 logging.getLogger("uvicorn.access").addHandler(q_handler)
 
-app = FastAPI(title="Luffy Panel", docs_url=None, redoc_url=None)
+app = FastAPI(title="sLv Panel", docs_url=None, redoc_url=None)
 
+DEFAULT_SECRET = os.environ.get("SECRET_KEY") or os.environ.get("APP_SECRET") or "sLv-panel-default-secret"
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
-    "secret": os.environ.get("SECRET_KEY", secrets.token_urlsafe(32)),
+    "secret": os.environ.get("SECRET_KEY") or os.environ.get("APP_SECRET") or DEFAULT_SECRET,
     "telegram_token": "",
     "telegram_admin_id": "",
     "bot_lang": "en",
+    "cookie_secure": os.environ.get("COOKIE_SECURE", "auto").lower(),
 }
+LOGIN_FAILED_MAX = int(os.environ.get("LOGIN_FAILED_MAX", 5))
+LOGIN_FAILED_WINDOW = int(os.environ.get("LOGIN_FAILED_WINDOW", 300))
+LOGIN_ATTEMPTS: dict = {}
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -81,6 +87,9 @@ UNLIMITED_QUOTA_BYTES = 53687091200000
 DEFAULT_PORT = 443
 
 DB_FILE = "panel_db.json"
+DB_BACKUP_FILE = "panel_db.json.bak"
+DB_TMP_FILE = "panel_db.json.tmp"
+APP_VERSION = "1.1.0"
 bot = None
 bot_polling_task: asyncio.Task | None = None
 
@@ -93,7 +102,7 @@ BOT_I18N = {
         "btn_create": "➕ Create User",
         "btn_addip": "🌐 Add Clean IP",
         "btn_lang": "🇮🇷 فارسی",
-        "welcome": "👑 <b>Welcome to Luffy Panel Telegram Bot!</b>\nManage your VLESS inbounds directly from your Telegram.",
+        "welcome": "👑 <b>Welcome to sLv Panel Telegram Bot!</b>\nManage your VLESS inbounds directly from your Telegram.",
         "lang_switched": "🌐 Language switched to <b>English</b>.",
         "stats": (
             "<b>📊 Server Status Dashboard</b>\n\n"
@@ -149,6 +158,19 @@ BOT_I18N = {
             "<b>Examples:</b>\n"
             "• <code>/create Ali 15 30</code> (15GB limit, 30 days validity)\n"
             "• <code>/create Reza 0 0</code> (Unlimited, No Expiry)"
+        ),
+        "test_format": (
+            "❌ <b>Invalid format.</b>\n"
+            "Format: <code>/test [name] [limit] [unit] [expiry] [expiry_unit]</code>\n"
+            "Example: <code>/test Demo 100 MB 2 hours</code>"
+        ),
+        "test_success": (
+            "✅ <b>Test subscription created!</b>\n\n"
+            "👤 <b>Name:</b> <code>{label}</code>\n"
+            "📊 <b>Quota:</b> <code>{quota}</code>\n"
+            "⌛ <b>Expiry:</b> <code>{expiry}</code>\n\n"
+            "🔗 <b>VLESS Link:</b>\n<code>{vless}</code>\n\n"
+            "🌐 <b>Subscription URL:</b>\n<code>{sub}</code>"
         ),
         "addip_guide": (
             "🌐 <b>How to add Clean IP:</b>\n\n"
@@ -233,6 +255,19 @@ BOT_I18N = {
             "• <code>/create Ali 15 30</code> (۱۵ گیگ، ۳۰ روز اعتبار)\n"
             "• <code>/create Reza 0 0</code> (نامحدود، بدون انقضا)"
         ),
+        "test_format": (
+            "❌ <b>فرمت اشتباه است.</b>\n"
+            "فرمت: <code>/test [نام] [حجم] [واحد] [انقضا] [واحد_انقضا]</code>\n"
+            "مثال: <code>/test Demo 100 MB 2 hours</code>"
+        ),
+        "test_success": (
+            "✅ <b>اشتراک آزمایشی ساخته شد!</b>\n\n"
+            "👤 <b>نام:</b> <code>{label}</code>\n"
+            "📊 <b>حجم:</b> <code>{quota}</code>\n"
+            "⌛ <b>انقضا:</b> <code>{expiry}</code>\n\n"
+            "🔗 <b>لینک VLESS:</b>\n<code>{vless}</code>\n\n"
+            "🌐 <b>آدرس اشتراک:</b>\n<code>{sub}</code>"
+        ),
         "addip_guide": (
             "🌐 <b>راهنمای افزودن آی‌پی تمیز:</b>\n\n"
             "از دستور <code>/addaddr</code> استفاده کن. فرمت:\n"
@@ -283,25 +318,46 @@ def build_main_keyboard():
 def save_db():
     data = {
         "auth_hash": AUTH["password_hash"],
+        "secret": CONFIG["secret"],
         "links": LINKS,
         "custom_addresses": CUSTOM_ADDRESSES,
         "telegram_token": CONFIG["telegram_token"],
         "telegram_admin_id": CONFIG["telegram_admin_id"],
         "bot_lang": CONFIG["bot_lang"],
     }
+    tmp_path = DB_TMP_FILE
     try:
-        with open(DB_FILE, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(DB_FILE):
+            try:
+                shutil.copy2(DB_FILE, DB_BACKUP_FILE)
+            except Exception:
+                pass
+        os.replace(tmp_path, DB_FILE)
     except Exception as e:
         logger.error(f"Error saving DB: {e}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
 
 def load_db():
     global CUSTOM_ADDRESSES, LINKS
     if not os.path.exists(DB_FILE):
+        env_admin_pw = os.environ.get("ADMIN_PASSWORD")
+        if env_admin_pw:
+            AUTH["password_hash"] = hash_password(env_admin_pw)
         return
     try:
         with open(DB_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+        stored_secret = data.get("secret") or os.environ.get("SECRET_KEY") or os.environ.get("APP_SECRET")
+        if stored_secret:
+            CONFIG["secret"] = stored_secret
         AUTH["password_hash"] = data.get("auth_hash", AUTH["password_hash"])
         LINKS.clear()
         LINKS.update(data.get("links", {}))
@@ -310,12 +366,50 @@ def load_db():
         CONFIG["telegram_token"] = data.get("telegram_token", "")
         CONFIG["telegram_admin_id"] = data.get("telegram_admin_id", "")
         CONFIG["bot_lang"] = data.get("bot_lang", "en") if data.get("bot_lang") in ("en", "fa") else "en"
+        restore_admin_password_if_needed()
     except Exception as e:
         logger.error(f"Error loading DB: {e}")
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
-def hash_password(pw: str) -> str:
-    return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
+def hash_password(pw: str, secret: str | None = None) -> str:
+    used_secret = secret or CONFIG.get("secret") or DEFAULT_SECRET
+    return hashlib.sha256(f"{pw}{used_secret}".encode()).hexdigest()
+
+
+def get_secret_candidates() -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for secret in [CONFIG.get("secret"), DEFAULT_SECRET, os.environ.get("SECRET_KEY"), os.environ.get("APP_SECRET"), "sLv-panel-default-secret"]:
+        if secret and secret not in seen:
+            candidates.append(secret)
+            seen.add(secret)
+    return candidates
+
+
+def password_matches(pw: str) -> bool:
+    target = str(pw or "")
+    if not target:
+        return False
+    env_admin_pw = os.environ.get("ADMIN_PASSWORD")
+    if env_admin_pw and target == env_admin_pw:
+        AUTH["password_hash"] = hash_password(env_admin_pw)
+        return True
+    for secret in get_secret_candidates():
+        if hash_password(target, secret) == AUTH["password_hash"]:
+            return True
+    return False
+
+
+def restore_admin_password_if_needed() -> None:
+    env_admin_pw = os.environ.get("ADMIN_PASSWORD")
+    if env_admin_pw:
+        AUTH["password_hash"] = hash_password(env_admin_pw)
+        return
+    if password_matches("admin"):
+        return
+    AUTH["password_hash"] = hash_password("admin")
+    save_db()
+
 
 AUTH = {"password_hash": hash_password("admin")}
 SESSIONS: dict = {}
@@ -385,7 +479,7 @@ def get_domain() -> str:
         .replace("https://", "").replace("http://", "")
     )
 
-def generate_vless_link(uuid: str, remark: str = "Luffy", address: str = None, port: int = None) -> str:
+def generate_vless_link(uuid: str, remark: str = "sLv", address: str = None, port: int = None) -> str:
     domain = get_domain()
     addr = address if address else domain
     use_port = port if port else DEFAULT_PORT
@@ -408,6 +502,24 @@ def parse_size_to_bytes(value: float, unit: str) -> int:
     if unit == "MB": return int(value * 1024 * 1024)
     if unit == "KB": return int(value * 1024)
     return int(value)
+
+def parse_expiry_delta(value, unit: str):
+    if value is None:
+        return None
+    try:
+        amount = float(value)
+    except (ValueError, TypeError):
+        return None
+    if amount <= 0:
+        return None
+    unit = (unit or "days").lower()
+    if unit in ("day", "days"):
+        return timedelta(days=amount)
+    if unit in ("hour", "hours"):
+        return timedelta(hours=amount)
+    if unit in ("minute", "minutes", "min", "mins"):
+        return timedelta(minutes=amount)
+    return timedelta(days=amount)
 
 def parse_expires_at(raw: str | None) -> datetime | None:
     if not raw:
@@ -576,6 +688,14 @@ async def restart_telegram_bot():
         if not _is_admin_chat(message.chat.id, admin_id):
             return
         resp = await handle_create_command(message.text)
+        await bot.send_message(message.chat.id, resp, parse_mode="HTML")
+
+    @bot.message_handler(commands=['test'])
+    @bot.message_handler(commands=['test'])
+    async def cmd_test(message):
+        if not _is_admin_chat(message.chat.id, admin_id):
+            return
+        resp = await handle_test_command(message.text)
         await bot.send_message(message.chat.id, resp, parse_mode="HTML")
 
     @bot.message_handler(commands=['addaddr'])
@@ -769,6 +889,9 @@ async def handle_create_command(text: str):
             "label": label,
             "limit_bytes": limit_bytes,
             "used_bytes": 0,
+            "daily_limit_bytes": 0,
+            "daily_used_bytes": 0,
+            "daily_usage_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             "max_connections": 0,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "active": True,
@@ -776,7 +899,7 @@ async def handle_create_command(text: str):
         }
 
     save_db()
-    vless_link = generate_vless_link(uid, remark=f"Luffy-{label}", port=DEFAULT_PORT)
+    vless_link = generate_vless_link(uid, remark=f"sLv-{label}", port=DEFAULT_PORT)
     sub_url = f"https://{get_domain()}/sub/{uid}"
 
     quota_str = _fmt_bytes(limit_bytes) if limit_bytes > 0 else L("unlimited")
@@ -785,6 +908,58 @@ async def handle_create_command(text: str):
     return L(
         "create_success",
         label=label, quota=quota_str, expiry=expiry_str,
+        vless=vless_link, sub=sub_url,
+    )
+
+async def handle_test_command(text: str):
+    parts = text.split()
+    if len(parts) < 6:
+        return L("test_format")
+    label = parts[1]
+    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
+        return L("create_bad_name")
+    try:
+        limit_value = float(parts[2])
+    except ValueError:
+        return L("create_bad_limit")
+    unit = parts[3].upper()
+    if unit not in ("GB", "MB", "KB"):
+        return L("test_format")
+    try:
+        expiry_value = float(parts[4])
+    except ValueError:
+        return L("test_format")
+    expiry_unit = parts[5].lower()
+    if expiry_unit not in ("days", "day", "hours", "hour", "minutes", "minute"):
+        return L("test_format")
+
+    limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, unit)
+    expires_delta = parse_expiry_delta(expiry_value, expiry_unit)
+    if expires_delta is None:
+        return L("test_format")
+    expires_at = (datetime.now(timezone.utc) + expires_delta).isoformat()
+    uid = f"{label}-{secrets.token_hex(4)}"
+    async with LINKS_LOCK:
+        LINKS[uid] = {
+            "label": uid,
+            "limit_bytes": limit_bytes,
+            "used_bytes": 0,
+            "daily_limit_bytes": 0,
+            "daily_used_bytes": 0,
+            "daily_usage_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "max_connections": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "active": True,
+            "expires_at": expires_at,
+        }
+    save_db()
+    vless_link = generate_vless_link(uid, remark=f"sLv-{uid}", port=DEFAULT_PORT)
+    sub_url = f"https://{get_domain()}/sub/{uid}"
+    quota_str = _fmt_bytes(limit_bytes) if limit_bytes > 0 else L("unlimited")
+    expiry_label = f"{int(expiry_value)} {expiry_unit}"
+    return L(
+        "test_success",
+        label=uid, quota=quota_str, expiry=expiry_label,
         vless=vless_link, sub=sub_url,
     )
 
@@ -875,7 +1050,7 @@ async def telegram_notifier_cron():
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    # NOTE: this used to return {"service": "Luffy Panel", ...} — a plaintext
+    # NOTE: this used to return {"service": "sLv Panel", ...} — a plaintext
     # admission that this server is a proxy panel, visible to anyone who simply
     # curls the domain. Active-probing/DPI systems check exactly this kind of
     # thing. Return something generic instead.
@@ -887,15 +1062,47 @@ async def health():
         conn_count = len(connections)
     return {"status": "ok", "connections": conn_count, "uptime": uptime()}
 
+def request_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
 @app.post("/api/login")
 async def api_login(request: Request):
     body = await request.json()
     password = str(body.get("password") or "")
-    if hash_password(password) != AUTH["password_hash"]:
+    client_ip = request_ip(request)
+    now_ts = time.time()
+    attempt = LOGIN_ATTEMPTS.get(client_ip, {"count": 0, "blocked_until": 0})
+    if attempt["blocked_until"] > now_ts:
+        raise HTTPException(status_code=429, detail="Too many login attempts. Try again later.")
+    if not password_matches(password):
+        attempt["count"] = attempt.get("count", 0) + 1
+        if attempt["count"] >= LOGIN_FAILED_MAX:
+            attempt["blocked_until"] = now_ts + LOGIN_FAILED_WINDOW
+            attempt["count"] = 0
+        LOGIN_ATTEMPTS[client_ip] = attempt
         raise HTTPException(status_code=401, detail="Invalid password")
+    LOGIN_ATTEMPTS.pop(client_ip, None)
     token = await create_session()
     resp = JSONResponse({"ok": True})
-    resp.set_cookie(key=SESSION_COOKIE, value=token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/")
+    secure_cookie = False
+    if CONFIG.get("cookie_secure") in ("1", "true", "yes"):
+        secure_cookie = True
+    elif CONFIG.get("cookie_secure") == "auto":
+        secure_cookie = get_domain() not in ("localhost", "127.0.0.1")
+    resp.set_cookie(
+        key=SESSION_COOKIE,
+        value=token,
+        max_age=SESSION_TTL,
+        httponly=True,
+        secure=secure_cookie,
+        samesite="lax",
+        path="/",
+    )
     return resp
 
 @app.post("/api/logout")
@@ -916,7 +1123,7 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
     body = await request.json()
     current = str(body.get("current_password") or "")
     new = str(body.get("new_password") or "")
-    if hash_password(current) != AUTH["password_hash"]:
+    if not password_matches(current):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
     if len(new) < 4:
         raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
@@ -976,26 +1183,32 @@ async def create_link(request: Request, _=Depends(require_auth)):
         if label in LINKS:
             raise HTTPException(status_code=400, detail="An inbound with this name already exists")
     limit_value = float(body.get("limit_value") or 0)
-    limit_unit = body.get("limit_unit") or "GB"
+    limit_unit = (body.get("limit_unit") or "GB").upper()
     limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+    daily_limit_value = float(body.get("daily_limit_value") or 0)
+    daily_limit_unit = (body.get("daily_limit_unit") or limit_unit).upper()
+    daily_limit_bytes = 0 if daily_limit_value <= 0 else parse_size_to_bytes(daily_limit_value, daily_limit_unit)
     max_conn = int(body.get("max_connections") or 0)
     if max_conn < 0:
         max_conn = 0
-    days_valid = body.get("days_valid")
+    expiry_value = body.get("expiry_value")
+    expiry_unit = (body.get("expiry_unit") or "days").lower()
     expires_at: str | None = None
-    if days_valid is not None:
-        try:
-            days_valid = int(days_valid)
-            if days_valid > 0:
-                expires_at = (datetime.now(timezone.utc) + timedelta(days=days_valid)).isoformat()
-        except (ValueError, TypeError):
-            pass
+    try:
+        expiry_delta = parse_expiry_delta(expiry_value, expiry_unit)
+        if expiry_delta is not None:
+            expires_at = (datetime.now(timezone.utc) + expiry_delta).isoformat()
+    except (ValueError, TypeError):
+        pass
     uid = label
     async with LINKS_LOCK:
         LINKS[uid] = {
             "label": label,
             "limit_bytes": limit_bytes,
             "used_bytes": 0,
+            "daily_limit_bytes": daily_limit_bytes,
+            "daily_used_bytes": 0,
+            "daily_usage_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             "max_connections": max_conn,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "active": True,
@@ -1003,10 +1216,17 @@ async def create_link(request: Request, _=Depends(require_auth)):
         }
     save_db()
     return {
-        "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
-        "max_connections": max_conn, "active": True, "created_at": LINKS[uid]["created_at"],
+        "uuid": uid,
+        "label": label,
+        "limit_bytes": limit_bytes,
+        "used_bytes": 0,
+        "daily_limit_bytes": daily_limit_bytes,
+        "daily_used_bytes": 0,
+        "max_connections": max_conn,
+        "active": True,
+        "created_at": LINKS[uid]["created_at"],
         "expires_at": expires_at,
-        "vless_link": generate_vless_link(uid, remark=f"Luffy-{label}", port=DEFAULT_PORT),
+        "vless_link": generate_vless_link(uid, remark=f"sLv-{label}", port=DEFAULT_PORT),
     }
 
 @app.get("/api/links")
@@ -1020,12 +1240,14 @@ async def list_links(_=Depends(require_auth)):
             "label": data["label"],
             "limit_bytes": data["limit_bytes"],
             "used_bytes": data["used_bytes"],
+            "daily_limit_bytes": data.get("daily_limit_bytes", 0),
+            "daily_used_bytes": data.get("daily_used_bytes", 0),
             "max_connections": data.get("max_connections", 0),
             "active": data["active"],
             "created_at": data["created_at"],
             "expires_at": data.get("expires_at"),
             "current_connections": await count_connections_for_link(uid),
-            "vless_link": generate_vless_link(uid, remark=f"Luffy-{data['label']}", port=DEFAULT_PORT),
+            "vless_link": generate_vless_link(uid, remark=f"sLv-{data['label']}", port=DEFAULT_PORT),
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
@@ -1040,20 +1262,29 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
             LINKS[uid]["active"] = bool(body["active"])
         if "limit_value" in body:
             limit_value = float(body.get("limit_value") or 0)
-            limit_unit = body.get("limit_unit") or "GB"
+            limit_unit = (body.get("limit_unit") or "GB").upper()
             LINKS[uid]["limit_bytes"] = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
+        if "daily_limit_value" in body:
+            daily_limit_value = float(body.get("daily_limit_value") or 0)
+            daily_limit_unit = (body.get("daily_limit_unit") or "GB").upper()
+            LINKS[uid]["daily_limit_bytes"] = 0 if daily_limit_value <= 0 else parse_size_to_bytes(daily_limit_value, daily_limit_unit)
         if "reset_usage" in body and body["reset_usage"]:
             LINKS[uid]["used_bytes"] = 0
+        if "reset_daily_usage" in body and body["reset_daily_usage"]:
+            LINKS[uid]["daily_used_bytes"] = 0
+            LINKS[uid]["daily_usage_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if "label" in body:
             LINKS[uid]["label"] = str(body["label"])[:60]
         if "max_connections" in body:
             mc = int(body["max_connections"] or 0)
             LINKS[uid]["max_connections"] = mc if mc >= 0 else 0
-        if "days_valid" in body:
+        if "expiry_value" in body:
+            expiry_value = body.get("expiry_value")
+            expiry_unit = (body.get("expiry_unit") or "days").lower()
             try:
-                dv = int(body["days_valid"])
-                if dv > 0:
-                    LINKS[uid]["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=dv)).isoformat()
+                expiry_delta = parse_expiry_delta(expiry_value, expiry_unit)
+                if expiry_delta is not None:
+                    LINKS[uid]["expires_at"] = (datetime.now(timezone.utc) + expiry_delta).isoformat()
                 else:
                     LINKS[uid]["expires_at"] = None
             except (ValueError, TypeError):
@@ -1141,7 +1372,7 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
     used = link["used_bytes"]
     limit = link["limit_bytes"]
     expires_at_str = link.get("expires_at")
-    
+
     usage_str = f"{_fmt_bytes(used)} / Unlimited" if limit == 0 else f"{_fmt_bytes(used)} / {_fmt_bytes(limit)}"
     pct = round((used / limit) * 100, 1) if limit > 0 else 0
     rem = limit - used if limit > 0 else -1
@@ -1157,185 +1388,145 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
         hours = (secs_left % 86400) // 3600
         expiry_str = f"{days} Days, {hours} Hours Left"
 
-    configs = [generate_vless_link(uid, remark=f"Luffy-{link['label']}", port=DEFAULT_PORT)]
+    configs = [generate_vless_link(uid, remark=f"sLv-{link['label']}", port=DEFAULT_PORT)]
     for i, addr in enumerate(addresses):
-        configs.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}-IP{i+1}", address=addr, port=DEFAULT_PORT))
+        configs.append(generate_vless_link(uid, remark=f"sLv-{link['label']}-IP{i+1}", address=addr, port=DEFAULT_PORT))
 
     configs_json = json.dumps(configs)
-    
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Luffy Connection Status</title>
-    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@400;600;700&display=swap" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>sLv Subscription</title>
+    <link href="https://fonts.googleapis.com/css2?family=Nunito+Sans:ital,opsz,wght@0,6..12,200..1000;1,6..12,200..1000&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
     <style>
         * {{ margin:0; padding:0; box-sizing:border-box; }}
         body {{
-            background: #060608;
-            font-family: 'Inter', 'Vazirmatn', sans-serif;
-            color: rgba(255,255,255,0.92);
-            padding: 20px;
+            min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
-            min-height: 100vh;
-        }}
-        .container {{
-            width: 100%;
-            max-width: 500px;
-            background: rgba(12,12,18,0.97);
-            border: 1px solid rgba(255,215,0,0.15);
-            border-radius: 20px;
             padding: 24px;
-            box-shadow: 0 0 24px rgba(255,215,0,0.1);
+            font-family: 'Nunito Sans', 'Vazirmatn', sans-serif;
+            color: #f5f7ff;
+            background: radial-gradient(circle at 10% 15%, rgba(112,214,255,0.16), transparent 22%),
+                        radial-gradient(circle at 85% 10%, rgba(168,85,247,0.14), transparent 15%),
+                        linear-gradient(135deg, #05070f 0%, #0e1326 100%);
         }}
-        .brand {{
-            text-align: center;
-            margin-bottom: 20px;
+        .shell {{
+            width: 100%;
+            max-width: 560px;
+            border-radius: 28px;
+            padding: 24px;
+            background: rgba(9, 12, 21, 0.82);
+            border: 1px solid rgba(255,255,255,0.14);
+            box-shadow: 0 30px 90px rgba(0,0,0,0.32);
+            backdrop-filter: blur(24px);
+            -webkit-backdrop-filter: blur(24px);
         }}
-        .brand h1 {{
-            font-family: 'Cinzel', serif;
-            font-size: 22px;
-            color: #FFD700;
-            letter-spacing: 2px;
+        .hero {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 14px 16px;
+            border-radius: 20px;
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.1);
+            margin-bottom: 16px;
         }}
+        .hero h1 {{ font-size: 20px; font-weight: 800; letter-spacing: 0.14em; text-transform: uppercase; color: #ffd166; }}
+        .chip {{
+            padding: 7px 12px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }}
+        .chip.active {{ background: rgba(74,222,128,0.16); color: #4ade80; border: 1px solid rgba(74,222,128,0.26); }}
+        .chip.expired {{ background: rgba(248,113,113,0.16); color: #f87171; border: 1px solid rgba(248,113,113,0.26); }}
         .card {{
-            background: rgba(20,20,28,0.9);
-            border: 1px solid rgba(255,215,0,0.08);
-            border-radius: 14px;
+            border-radius: 20px;
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.12);
             padding: 16px;
             margin-bottom: 14px;
         }}
-        .user-header {{
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 12px;
-        }}
-        .username {{
-            font-size: 18px;
-            font-weight: 700;
-            color: #fff;
-        }}
-        .status-badge {{
-            padding: 3px 8px;
-            border-radius: 6px;
-            font-size: 10px;
-            font-weight: 800;
-            text-transform: uppercase;
-        }}
-        .status-active {{ background: rgba(74,222,128,0.15); color: #4ade80; border: 1px solid rgba(74,222,128,0.3); }}
-        .status-expired {{ background: rgba(248,113,113,0.15); color: #f87171; border: 1px solid rgba(248,113,113,0.3); }}
-        .label {{ font-size: 11px; color: rgba(255,255,255,0.4); text-transform: uppercase; letter-spacing: 1px; }}
-        .val {{ font-size: 16px; font-weight: 600; color: #fff; margin-top: 2px; }}
-        .progress-bar {{
-            height: 6px;
-            background: rgba(255,255,255,0.05);
-            border-radius: 3px;
-            overflow: hidden;
-            margin: 12px 0;
-        }}
-        .progress-fill {{
-            height: 100%;
-            background: linear-gradient(90deg, #FFD700, #C8900A);
-            transition: width 0.5s;
-        }}
-        .config-list {{
-            margin-top: 15px;
-        }}
-        .config-item {{
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            background: rgba(28,28,40,0.8);
-            border: 1px solid rgba(255,255,255,0.05);
-            padding: 10px 12px;
-            border-radius: 8px;
-            margin-bottom: 8px;
-            font-size: 12.5px;
-        }}
-        .config-name {{
-            font-weight: 600;
-            color: rgba(255,255,255,0.8);
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-            max-width: 60%;
-        }}
-        .btn {{
-            font-family: inherit;
-            font-size: 11.5px;
-            font-weight: 700;
-            border-radius: 6px;
-            padding: 5px 10px;
-            cursor: pointer;
-            border: none;
-            transition: all 0.2s;
-        }}
-        .btn-gold {{ background: #FFD700; color: #000; }}
-        .btn-gold:hover {{ filter: brightness(1.1); }}
-        .btn-ghost {{ background: rgba(255,255,255,0.05); color: #fff; border: 1px solid rgba(255,255,255,0.1); }}
-        .btn-ghost:hover {{ background: rgba(255,255,255,0.1); }}
-        .mo {{
-            position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 200; display: none; align-items: center; justify-content: center; backdrop-filter: blur(8px);
-        }}
-        .mo.show {{ display: flex; }}
-        .mo-box {{
-            background: rgba(20,20,28,0.95); border: 1px solid rgba(255,215,0,0.2); border-radius: 18px; padding: 24px; width: 90%; max-width: 320px; text-align: center; position: relative;
-        }}
-        .mo-box img {{ max-width: 100%; border-radius: 8px; border: 3px solid rgba(255,215,0,0.15); margin-top: 15px; }}
-        .mo-close {{ position: absolute; top: 12px; right: 12px; font-size: 16px; cursor: pointer; color: rgba(255,255,255,0.4); background: none; border: none; }}
-        .toast {{
-            position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(16px); background: #0c0c10; color: #FFD700; border: 1px solid rgba(255,215,0,0.2); border-radius: 10px; padding: 10px 18px; font-size: 13px; font-weight: 600; opacity: 0; transition: all 0.3s; z-index: 999;
-        }}
+        .label {{ font-size: 10px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase; color: rgba(255,255,255,0.5); margin-bottom: 6px; }}
+        .value {{ font-size: 16px; font-weight: 700; color: #ffffff; }}
+        .muted {{ color: rgba(255,255,255,0.72); font-size: 13px; margin-top: 6px; }}
+        .progress {{ height: 8px; border-radius: 999px; overflow: hidden; background: rgba(255,255,255,0.08); margin: 12px 0 8px; }}
+        .progress > div {{ height: 100%; border-radius: inherit; background: linear-gradient(90deg, #70d6ff, #ffd166); transition: width 0.4s ease; }}
+        .stats-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }}
+        .node-list {{ display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }}
+        .node {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 14px; border-radius: 14px; background: rgba(10,15,26,0.68); border: 1px solid rgba(255,255,255,0.08); }}
+        .node-name {{ font-size: 13px; font-weight: 600; color: #f5f7ff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+        .actions {{ display: flex; gap: 6px; }}
+        .btn {{ font-family: inherit; font-size: 11px; font-weight: 700; border-radius: 999px; border: none; padding: 7px 10px; cursor: pointer; transition: all 0.2s; }}
+        .btn-gold {{ background: linear-gradient(135deg, #ffd166, #ffb347); color: #090c16; }}
+        .btn-ghost {{ background: rgba(255,255,255,0.08); color: #fff; border: 1px solid rgba(255,255,255,0.1); }}
+        .btn:hover {{ transform: translateY(-1px); }}
+        .modal {{ position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,0.72); backdrop-filter: blur(12px); z-index: 200; }}
+        .modal.show {{ display: flex; }}
+        .modal-box {{ width: min(92vw, 320px); border-radius: 20px; padding: 20px; background: rgba(10,14,24,0.95); border: 1px solid rgba(255,255,255,0.14); text-align: center; }}
+        .modal-box img {{ width: 100%; border-radius: 14px; margin-top: 12px; border: 2px solid rgba(255,255,255,0.12); }}
+        .close {{ position: absolute; top: 10px; right: 12px; border: none; background: transparent; color: rgba(255,255,255,0.75); font-size: 16px; cursor: pointer; }}
+        .toast {{ position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%) translateY(16px); background: rgba(8,10,18,0.95); color: #ffd166; border: 1px solid rgba(255,255,255,0.12); border-radius: 999px; padding: 10px 14px; font-size: 12px; font-weight: 700; opacity: 0; transition: all 0.3s; z-index: 999; }}
         .toast.show {{ opacity: 1; transform: translateX(-50%) translateY(0); }}
+        @media (max-width: 560px) {{
+            .shell {{ padding: 18px; border-radius: 22px; }}
+            .hero {{ flex-direction: column; align-items: flex-start; }}
+            .stats-grid {{ grid-template-columns: 1fr; }}
+        }}
     </style>
 </head>
 <body>
-    <div class="toast" id="toast">Copied!</div>
-    <div class="container">
-        <div class="brand">
-            <h1>LUFFY GATEWAY</h1>
+    <div class="toast" id="toast">Copied</div>
+    <div class="shell">
+        <div class="hero">
+            <div>
+                <h1>sLv Gateway</h1>
+                <div class="muted">Subscription status and available nodes</div>
+            </div>
+            <div class="chip {'active' if link['active'] else 'expired'}">{'Active' if link['active'] else 'Inactive'}</div>
         </div>
-        <div class="card">
-            <div class="user-header">
-                <span class="username">{link['label']}</span>
-                <span class="status-badge {'status-active' if link['active'] else 'status-expired'}">
-                    {'Active' if link['active'] else 'Inactive'}
-                </span>
-            </div>
-            
-            <div class="progress-bar">
-                <div class="progress-fill" style="width: {pct}%"></div>
-            </div>
 
-            <div style="display:flex; justify-content: space-between; margin-top: 10px;">
+        <div class="card">
+            <div class="label">Inbound</div>
+            <div class="value">{link['label']}</div>
+            <div class="progress"><div style="width: {pct}%"></div></div>
+            <div class="stats-grid">
                 <div>
                     <div class="label">Usage</div>
-                    <div class="val">{usage_str}</div>
+                    <div class="value">{usage_str}</div>
                 </div>
                 <div>
                     <div class="label">Remaining</div>
-                    <div class="val">{rem_str}</div>
+                    <div class="value">{rem_str}</div>
                 </div>
             </div>
         </div>
 
         <div class="card">
-            <div class="label">Time Validity / Expiration</div>
-            <div class="val" style="color: #FFD700; font-size: 18px; font-weight: 700; margin-top: 4px;">{expiry_str}</div>
+            <div class="label">Expiration</div>
+            <div class="value" style="color:#ffd166">{expiry_str}</div>
+            <div class="muted">Your subscription stays active until the time shown above.</div>
         </div>
 
-        <h3 style="margin: 20px 0 10px 5px; font-size: 14px; letter-spacing: 1px; color: rgba(255,255,255,0.5);">AVAILABLE NODES</h3>
-        <div class="config-list" id="config-list"></div>
+        <div class="card">
+            <div class="label">Available Nodes</div>
+            <div class="node-list" id="config-list"></div>
+        </div>
     </div>
 
-    <div class="mo" id="qr-modal" onclick="if(event.target===this)this.classList.remove('show')">
-        <div class="mo-box">
-            <button class="mo-close" onclick="document.getElementById('qr-modal').classList.remove('show')">✕</button>
-            <h3 style="color:#FFD700; font-family:'Cinzel',serif; font-size:14px;">QR Code</h3>
+    <div class="modal" id="qr-modal" onclick="if(event.target===this)this.classList.remove('show')">
+        <div class="modal-box">
+            <button class="close" onclick="document.getElementById('qr-modal').classList.remove('show')">✕</button>
+            <div class="label" style="margin-top:8px">QR Code</div>
             <img id="qr-img" src="" alt="QR">
         </div>
     </div>
@@ -1343,7 +1534,7 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
     <script>
         const configs = {configs_json};
         const listEl = document.getElementById('config-list');
-        
+
         function showToast(txt) {{
             const t = document.getElementById('toast');
             t.textContent = txt;
@@ -1365,11 +1556,11 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
 
         listEl.innerHTML = configs.map((cfg, i) => {{
             const parts = cfg.split('#');
-            const remark = parts[1] ? decodeURIComponent(parts[1]) : 'Node ' + (i+1);
+            const remark = parts[1] ? decodeURIComponent(parts[1]) : 'Node ' + (i + 1);
             return `
-                <div class="config-item">
-                    <span class="config-name">${{remark}}</span>
-                    <div style="display:flex; gap: 5px;">
+                <div class="node">
+                    <div class="node-name">${{remark}}</div>
+                    <div class="actions">
                         <button class="btn btn-ghost" onclick="copyTxt('${{cfg}}')">Copy</button>
                         <button class="btn btn-gold" onclick="showQR('${{cfg}}')">QR</button>
                     </div>
@@ -1397,9 +1588,9 @@ def generate_subscription_content(link: dict, uid: str, addresses: list[str]) ->
     status_node = generate_vless_link(uid, remark=f"📊 {usage_str} | ⏳ {expiry_str}", address="0.0.0.0", port=DEFAULT_PORT)
     links_out = [status_node]
     
-    links_out.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}", port=DEFAULT_PORT))
+    links_out.append(generate_vless_link(uid, remark=f"sLv-{link['label']}", port=DEFAULT_PORT))
     for i, addr in enumerate(addresses):
-        links_out.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}-IP{i+1}", address=addr, port=DEFAULT_PORT))
+        links_out.append(generate_vless_link(uid, remark=f"sLv-{link['label']}-IP{i+1}", address=addr, port=DEFAULT_PORT))
             
     return "\n".join(links_out)
 
@@ -1475,6 +1666,12 @@ async def parse_vless_header(first_chunk: bytes):
         raise ValueError(f"unknown address type: {addr_type}")
     return command, address, port, first_chunk[pos:]
 
+def _normalize_daily_usage(link: dict) -> None:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if link.get("daily_usage_date") != today:
+        link["daily_used_bytes"] = 0
+        link["daily_usage_date"] = today
+
 async def check_quota(uid: str, extra_bytes: int) -> bool:
     async with LINKS_LOCK:
         link = LINKS.get(uid)
@@ -1483,14 +1680,20 @@ async def check_quota(uid: str, extra_bytes: int) -> bool:
         expires_at = parse_expires_at(link.get("expires_at"))
         if expires_at is not None and expires_at < datetime.now(timezone.utc):
             return False
-        if link["limit_bytes"] == 0:
-            return True
-        return (link["used_bytes"] + extra_bytes) <= link["limit_bytes"]
+        _normalize_daily_usage(link)
+        if link.get("limit_bytes", 0) > 0 and (link.get("used_bytes", 0) + extra_bytes) > link.get("limit_bytes", 0):
+            return False
+        if link.get("daily_limit_bytes", 0) > 0 and (link.get("daily_used_bytes", 0) + extra_bytes) > link.get("daily_limit_bytes", 0):
+            return False
+        return True
 
 async def add_usage(uid: str, n: int):
     async with LINKS_LOCK:
         if uid in LINKS:
-            LINKS[uid]["used_bytes"] += n
+            link = LINKS[uid]
+            _normalize_daily_usage(link)
+            link["used_bytes"] = link.get("used_bytes", 0) + n
+            link["daily_used_bytes"] = link.get("daily_used_bytes", 0) + n
 
 async def ws_to_tcp(websocket, writer, conn_id, link_uid):
     try:
@@ -1693,242 +1896,206 @@ PANEL_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title data-en="Luffy Panel" data-fa="LUFFY PANEL">Luffy Panel</title>
-<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Inter:wght@300;400;500;600;700&family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
+<title data-en="sLv Panel" data-fa="sLv PANEL">sLv Panel</title>
+<link href="https://fonts.googleapis.com/css2?family=Nunito+Sans:ital,opsz,wght@0,6..12,200..1000;1,6..12,200..1000&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
-  --gold:#FFD700;--gold2:#FFC200;--gold3:#C8900A;--gold-dim:rgba(255,215,0,0.12);
-  --black:#060608;--black2:#0c0c10;--black3:#111118;
-  --surface:rgba(12,12,18,0.97);--surface2:rgba(20,20,28,0.9);--surface3:rgba(28,28,40,0.8);
-  --border:rgba(255,215,0,0.1);--border2:rgba(255,215,0,0.2);
-  --text:rgba(255,255,255,0.92);--text2:rgba(255,215,0,0.7);--text3:rgba(255,255,255,0.4);
-  --white-neon:rgba(255,255,255,0.85);--white-glow:0 0 16px rgba(255,255,255,0.25);
-  --gold-glow:0 0 20px rgba(255,215,0,0.4);
-  --green:#4ade80;--green-dim:rgba(74,222,128,0.1);
-  --red:#f87171;--red-dim:rgba(248,113,113,0.1);
-  --yellow:#fbbf24;
-  --nav-w:64px;
+  --gold:#ffd166;--gold2:#ffb347;--cyan:#70d6ff;--violet:#a855f7;--pink:#f14d80;
+  --black:#05070f;--black2:#090c16;--black3:#101726;
+  --surface:rgba(15,19,34,0.74);--surface2:rgba(20,25,44,0.88);--surface3:rgba(23,28,50,0.96);
+  --border:rgba(255,255,255,0.14);--border2:rgba(255,255,255,0.22);
+  --text:rgba(255,255,255,0.94);--text2:rgba(170,184,255,0.82);--text3:rgba(179,192,255,0.55);
+  --shadow:0 28px 80px rgba(0,0,0,0.26);
+  --nav-w:72px;
 }
 body.light-mode {
-  --black: #f0f2f5; --black2: #ffffff; --black3: #e4e6eb;
-  --surface: rgba(255,255,255,0.95); --surface2: #ffffff; --surface3: #f9fafb;
-  --border: rgba(0,0,0,0.1); --border2: rgba(0,0,0,0.2);
-  --text: #111827; --text2: #4b5563; --text3: #6b7280;
-  --gold-dim: rgba(218, 165, 32, 0.15);
-  --gold-glow: 0 4px 14px rgba(0,0,0,0.1);
+  --black:#eef2ff;--black2:#ffffff;--black3:#f4f7ff;
+  --surface:rgba(255,255,255,0.86);--surface2:rgba(255,255,255,0.94);--surface3:rgba(248,250,255,0.98);
+  --border:rgba(15,23,42,0.08);--border2:rgba(15,23,42,0.12);
+  --text:#111827;--text2:#475569;--text3:#66748b;
+  --shadow:0 22px 48px rgba(15,23,42,0.12);
 }
-html,body{height:100%;background:var(--black);transition: background 0.3s, color 0.3s;}
-body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);display:flex;min-height:100vh;}
+html,body{height:100%;background:radial-gradient(circle at 10% 15%,rgba(112,214,255,0.16),transparent 22%),radial-gradient(circle at 80% 10%,rgba(168,85,247,0.14),transparent 12%),radial-gradient(circle at 80% 80%,rgba(255,160,75,0.10),transparent 18%),linear-gradient(180deg,#05070f 0%,#0e1326 100%);transition:background 0.4s,color 0.4s;}
+body.light-mode{background:radial-gradient(circle at 15% 18%,rgba(112,214,255,0.1),transparent 22%),radial-gradient(circle at 75% 12%,rgba(168,85,247,0.08),transparent 14%),linear-gradient(180deg,#f8fbff 0%,#e4ecff 100%);}
+body{font-family:'Nunito Sans','Vazirmatn',sans-serif;color:var(--text);display:flex;min-height:100vh;position:relative;}
 body[dir="rtl"]{direction:rtl;text-align:right}
-::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:rgba(255,215,0,0.2);border-radius:4px}
-.bg-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background:radial-gradient(ellipse 70% 50% at 50% -10%,var(--gold-dim),transparent 60%)}
-.grid-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background-image:linear-gradient(rgba(128,128,128,0.05) 1px,transparent 1px),linear-gradient(90deg,rgba(128,128,128,0.05) 1px,transparent 1px);background-size:56px 56px}
-.sidebar{position:fixed;left:0;top:0;bottom:0;width:var(--nav-w);background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;z-index:100;transition:all .3s cubic-bezier(.4,0,.2,1);backdrop-filter:blur(20px);}
-.sidebar::after{content:'';position:absolute;top:0;right:0;bottom:0;width:1px;background:linear-gradient(180deg,transparent,rgba(255,215,0,0.3) 30%,rgba(255,215,0,0.3) 70%,transparent)}
-.light-mode .sidebar::after{display:none;}
-.sb-brand{padding:16px 0;display:flex;flex-direction:column;align-items:center;gap:2px;border-bottom:1px solid var(--border);flex-shrink:0}
-.sb-hat{filter:drop-shadow(0 0 10px rgba(255,215,0,.6));transition:filter .3s}
-.sb-hat:hover{filter:drop-shadow(0 0 18px rgba(255,215,0,.9))}
-.sb-title{font-family:'Cinzel',serif;font-size:8px;letter-spacing:.18em;color:rgba(255,215,0,.6);text-transform:uppercase;white-space:nowrap;overflow:hidden}
-.sb-nav{flex:1;display:flex;flex-direction:column;justify-content:flex-end;padding-bottom:12px;gap:2px;padding-left:8px;padding-right:8px}
-.nav-item{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;padding:10px 6px;border-radius:12px;color:var(--text3);cursor:pointer;transition:all .2s cubic-bezier(.4,0,.2,1);border:1px solid transparent;position:relative;overflow:hidden;text-decoration:none;background:none;width:100%;font-family:inherit;}
-.nav-item::before{content:'';position:absolute;inset:0;border-radius:12px;background:linear-gradient(135deg,var(--gold-dim),transparent);opacity:0;transition:opacity .2s}
-.nav-item:hover{color:var(--gold);border-color:rgba(255,215,0,.12)}
+*::selection{background:rgba(112,214,255,0.24);color:#fff}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.16);border-radius:999px}
+.bg-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background:radial-gradient(circle at 12% 18%,rgba(112,214,255,0.24),transparent 18%),radial-gradient(circle at 85% 12%,rgba(168,85,247,0.18),transparent 12%),radial-gradient(circle at 70% 80%,rgba(255,160,75,0.13),transparent 16%);}
+.grid-fixed{position:fixed;inset:0;z-index:0;pointer-events:none;background-image:linear-gradient(rgba(255,255,255,0.05) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,0.05) 1px,transparent 1px);background-size:72px 72px;opacity:0.4;}
+.sidebar{position:fixed;left:0;top:0;bottom:0;width:var(--nav-w);background:rgba(15,19,34,0.55);border-right:1px solid rgba(255,255,255,0.08);display:flex;flex-direction:column;z-index:100;transition:all .35s ease;backdrop-filter:blur(24px);box-shadow:0 0 0 1px rgba(255,255,255,0.02);}
+.sidebar::after{content:'';position:absolute;top:0;right:0;bottom:0;width:1px;background:linear-gradient(180deg,transparent,rgba(255,255,255,0.18) 25%,rgba(255,255,255,0.08) 55%,transparent)}
+.light-mode .sidebar::after{display:none}
+.sb-brand{padding:18px 0;display:flex;flex-direction:column;align-items:center;gap:4px;border-bottom:1px solid rgba(255,255,255,0.08);flex-shrink:0}
+.sb-hat{filter:drop-shadow(0 0 14px rgba(112,214,255,.5));transition:filter .3s}
+.sb-hat:hover{filter:drop-shadow(0 0 24px rgba(112,214,255,.7))}
+.sb-title{font-family:'Nunito Sans','Vazirmatn',sans-serif;font-size:8px;letter-spacing:.22em;color:rgba(255,255,255,0.66);text-transform:uppercase}
+.sb-nav{flex:1;display:flex;flex-direction:column;justify-content:flex-end;padding:10px 10px 14px;gap:6px}
+.nav-item{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;padding:12px 6px;border-radius:16px;color:var(--text3);cursor:pointer;transition:all .25s ease;position:relative;text-decoration:none;background:transparent;border:1px solid transparent;font-family:inherit;}
+.nav-item::before{content:'';position:absolute;inset:0;border-radius:16px;background:linear-gradient(135deg,rgba(112,214,255,0.18),transparent);opacity:0;transition:opacity .25s}
+.nav-item:hover{color:var(--cyan);border-color:rgba(112,214,255,0.16);transform:translateY(-1px)}
 .nav-item:hover::before{opacity:1}
-.nav-item.active{color:var(--gold);border-color:rgba(255,215,0,.22);background:var(--gold-dim);box-shadow:0 0 16px rgba(255,215,0,.1),inset 0 1px 0 rgba(255,215,0,.12)}
+.nav-item.active{color:var(--gold);border-color:rgba(255,209,102,0.24);background:rgba(255,209,102,0.08);box-shadow:0 18px 40px rgba(255,209,102,0.08);}
 .nav-item.active::before{opacity:1}
-.nav-icon{width:18px;height:18px;flex-shrink:0;transition:transform .2s}
-.nav-item:hover .nav-icon,.nav-item.active .nav-icon{transform:scale(1.1)}
-.nav-label{font-size:8.5px;font-weight:600;letter-spacing:.05em;white-space:nowrap;overflow:hidden}
-.nav-badge{position:absolute;top:5px;right:5px;background:var(--gold);color:#000;font-size:8px;font-weight:800;min-width:14px;height:14px;border-radius:7px;display:flex;align-items:center;justify-content:center;padding:0 3px}
-.sb-bottom{padding:8px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:6px;flex-shrink:0}
-.lang-row{display:flex;gap:4px}
-.lang-btn{flex:1;padding:5px 2px;border:1px solid var(--border);border-radius:7px;background:none;color:var(--text3);font-size:9px;font-weight:700;cursor:pointer;transition:all .2s;font-family:inherit;letter-spacing:.05em}
-.lang-btn.active{background:var(--gold-dim);border-color:var(--gold);color:var(--gold)}
-.lang-btn:hover:not(.active){border-color:rgba(255,215,0,.15);color:rgba(255,215,0,.5)}
-.logout-btn{display:flex;align-items:center;justify-content:center;padding:7px;border:1px solid rgba(248,113,113,.15);border-radius:8px;background:rgba(248,113,113,.06);color:rgba(248,113,113,.6);cursor:pointer;transition:all .2s;font-size:10px;gap:4px;font-weight:600;font-family:inherit}
-.logout-btn:hover{background:rgba(248,113,113,.12);border-color:rgba(248,113,113,.3);color:var(--red)}
-.theme-toggle{background:transparent;border:1px solid var(--border);color:var(--text3);border-radius:7px;padding:4px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.2s;}
-.theme-toggle:hover{background:var(--surface3);color:var(--gold);border-color:var(--gold);}
-.main{margin-left:var(--nav-w);flex:1;padding:24px 28px 48px;min-height:100vh;position:relative;z-index:1}
+.nav-icon{width:20px;height:20px;flex-shrink:0;transition:transform .2s}
+.nav-item:hover .nav-icon,.nav-item.active .nav-icon{transform:scale(1.08)}
+.nav-label{font-size:9px;font-weight:700;letter-spacing:.05em;white-space:nowrap;}
+.nav-badge{position:absolute;top:8px;right:8px;background:var(--gold);color:#111;box-shadow:0 10px 18px rgba(0,0,0,.14);font-size:9px;font-weight:800;min-width:16px;height:16px;border-radius:999px;display:flex;align-items:center;justify-content:center;padding:0 5px}
+.sb-bottom{padding:14px 10px 16px;border-top:1px solid rgba(255,255,255,0.08);display:flex;flex-direction:column;gap:10px;flex-shrink:0}
+.lang-row{display:flex;gap:6px}
+.lang-btn{flex:1;padding:8px 4px;border:1px solid rgba(255,255,255,0.1);border-radius:999px;background:rgba(255,255,255,0.04);color:var(--text3);font-size:11px;font-weight:700;cursor:pointer;transition:all .25s;font-family:inherit}
+.lang-btn.active{background:linear-gradient(135deg,rgba(255,209,102,0.18),rgba(255,255,255,0.06));border-color:rgba(255,209,102,0.26);color:var(--gold)}
+.lang-btn:hover:not(.active){background:rgba(255,255,255,0.08);color:var(--cyan);}
+.logout-btn{display:flex;align-items:center;justify-content:center;padding:10px;border:1px solid rgba(248,113,113,0.18);border-radius:16px;background:rgba(248,113,113,0.08);color:rgba(248,113,113,0.9);cursor:pointer;transition:all .25s;font-size:11px;gap:8px;font-weight:700}
+.logout-btn:hover{background:rgba(248,113,113,0.14);border-color:rgba(248,113,113,0.28)}
+.theme-toggle{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);color:var(--text3);border-radius:999px;padding:8px 12px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.25s;}
+.theme-toggle:hover{background:rgba(255,255,255,0.12);color:var(--gold)}
+.main{margin-left:var(--nav-w);flex:1;padding:28px 32px 52px;min-height:100vh;position:relative;z-index:1}
 .page{display:none;animation:pgIn .35s ease}
 .page.active{display:block}
-@keyframes pgIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
-.page-header{margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
-.page-title{font-family:'Cinzel',serif;font-size:16px;font-weight:700;color:var(--text);letter-spacing:.04em}
-.page-sub{font-size:11px;color:var(--text3);margin-top:3px;letter-spacing:.02em}
-.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}
-.stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:16px;position:relative;overflow:hidden;transition:all .25s;animation:cIn .5s ease both}
-.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,215,0,0.4),transparent)}
-.light-mode .stat-card::before{display:none;}
-.stat-card:hover{border-color:var(--border2);transform:translateY(-2px);box-shadow:var(--gold-glow)}
+@keyframes pgIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+.page-header{margin-bottom:24px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:16px}
+.page-title{font-family:'Nunito Sans','Vazirmatn',sans-serif;font-size:20px;font-weight:800;color:var(--text);letter-spacing:.08em;text-transform:uppercase}
+.page-sub{font-size:12px;color:var(--text3);margin-top:4px;letter-spacing:.08em}
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:18px}
+.stat-card{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);border-radius:24px;padding:22px;position:relative;overflow:hidden;transition:all .3s;animation:cIn .5s ease both;backdrop-filter:blur(18px);box-shadow:var(--shadow)}
+.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,0.24),transparent)}
+.stat-card:hover{transform:translateY(-2px);box-shadow:0 30px 90px rgba(0,0,0,.28)}
 @keyframes cIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
-.stat-label{font-size:9.5px;color:var(--text3);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
-.stat-val{font-size:20px;font-weight:700;color:var(--text);letter-spacing:-.02em}
-.stat-unit{font-size:11px;font-weight:400;color:var(--text3)}
-.card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:10px;position:relative;overflow:hidden;transition:all .25s;animation:cIn .5s ease both}
-.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,215,0,0.25),transparent)}
-.light-mode .card::before{display:none;}
-.card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
-.card-title{font-size:12px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:6px}
-.chart-container{height:170px;width:100%}
-.btn{font-family:inherit;font-size:11.5px;font-weight:700;border-radius:8px;padding:7px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;border:none;transition:all .2s;letter-spacing:.03em}
-.btn-gold{background:linear-gradient(135deg,#FFD700,#C8900A);color:#000;box-shadow:0 0 16px rgba(255,215,0,.25)}
-.btn-gold:hover{filter:brightness(1.1);transform:translateY(-1px);box-shadow:0 0 24px rgba(255,215,0,.4)}
-.btn-ghost{background:var(--surface3);color:var(--text);border:1px solid var(--border)}
-.btn-danger{background:var(--red-dim);color:var(--red);border:1px solid rgba(248,113,113,.15)}
-.btn-sm{padding:4px 9px;font-size:10.5px}
-.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.stat-label{font-size:10px;color:var(--text3);font-weight:700;text-transform:uppercase;letter-spacing:.12em;margin-bottom:10px}
+.stat-val{font-size:24px;font-weight:800;color:var(--text);letter-spacing:-.03em}
+.stat-unit{font-size:11px;font-weight:500;color:var(--text3);margin-left:6px}
+.card{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);border-radius:24px;padding:20px;margin-bottom:14px;position:relative;overflow:hidden;transition:all .3s;animation:cIn .5s ease both;backdrop-filter:blur(18px);box-shadow:var(--shadow)}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,0.18),transparent)}
+.card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;gap:16px}
+.card-title{font-size:13px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:8px}
+.chart-container{height:180px;width:100%}
+.btn{font-family:inherit;font-size:12px;font-weight:800;border-radius:999px;padding:10px 18px;cursor:pointer;display:inline-flex;align-items:center;gap:8px;border:none;transition:all .25s;letter-spacing:.04em}
+.btn-gold{background:linear-gradient(135deg,rgba(112,214,255,0.95),rgba(168,85,247,0.95));color:#080b16;box-shadow:0 22px 50px rgba(112,214,255,.18);}
+.btn-gold:hover{transform:translateY(-1px);box-shadow:0 26px 58px rgba(112,214,255,.24)}
+.btn-ghost{background:rgba(255,255,255,.08);color:var(--text);border:1px solid rgba(255,255,255,.14);backdrop-filter:blur(16px);}
+.btn-ghost:hover{background:rgba(255,255,255,.14);}
+.btn-danger{background:linear-gradient(135deg,rgba(248,113,113,.2),rgba(236,72,153,.22));color:#fff;border:1px solid rgba(248,113,113,.25);}
+.btn-sm{padding:8px 14px;font-size:11px}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .tbl-wrap{overflow-x:auto}
-.tbl{width:100%;border-collapse:collapse}
-.tbl th{text-align:left;font-size:9.5px;font-weight:700;color:var(--text3);padding:9px 11px;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid var(--border);background:var(--surface3)}
-.tbl td{padding:9px 11px;border-bottom:1px solid var(--border);font-size:12.5px;vertical-align:middle}
-.tag{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;font-size:9px;font-weight:800;letter-spacing:.05em;text-transform:uppercase}
-.tag-vless{background:var(--gold-dim);color:var(--gold);border:1px solid var(--border)}
-.tag-port{background:rgba(167,139,250,.1);color:#a78bfa;border:1px solid rgba(167,139,250,.2)}
-.tag-on{background:var(--green-dim);color:var(--green);border:1px solid rgba(74,222,128,.2)}
-.tag-off{background:var(--red-dim);color:var(--red);border:1px solid rgba(248,113,113,.2)}
-.pill{display:flex;align-items:center;gap:7px;font-size:11px}
-.pill-used{color:var(--text);font-weight:600}
-.pill-bar{flex:1;height:4px;background:var(--border);border-radius:2px;min-width:40px}
-.pill-fill{height:100%;border-radius:2px;transition:width .4s}
+.tbl{width:100%;border-collapse:separate;border-spacing:0;min-width:720px}
+.tbl th{text-align:left;font-size:10px;font-weight:700;color:var(--text3);padding:14px 18px;text-transform:uppercase;letter-spacing:.1em;border-bottom:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.04)}
+.tbl td{padding:14px 18px;border-bottom:1px solid rgba(255,255,255,.08);font-size:13px;vertical-align:middle;color:var(--text)}
+.tbl tr:hover{background:rgba(255,255,255,.06)}
+.tag{display:inline-flex;align-items:center;padding:5px 12px;border-radius:999px;font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}
+.tag-vless{background:rgba(255,209,102,.12);color:var(--gold);border:1px solid rgba(255,209,102,.18)}
+.tag-port{background:rgba(167,139,250,.12);color:#d8b4fe;border:1px solid rgba(167,139,250,.2)}
+.tag-on{background:rgba(74,222,128,.12);color:var(--green);border:1px solid rgba(74,222,128,.2)}
+.tag-off{background:rgba(248,113,113,.12);color:var(--pink);border:1px solid rgba(248,113,113,.2)}
+.pill{display:flex;align-items:center;gap:8px;font-size:11px}
+.pill-used{color:var(--text);font-weight:700}
+.pill-bar{flex:1;height:5px;background:rgba(255,255,255,.08);border-radius:999px;min-width:40px}
+.pill-fill{height:100%;border-radius:999px;transition:width .4s}
 .pill-lim{color:var(--text3);font-size:10px}
-.toggle{width:32px;height:17px;border-radius:9px;background:var(--surface3);position:relative;cursor:pointer;transition:all .28s;border:1px solid var(--border);flex-shrink:0}
-.toggle::after{content:'';position:absolute;width:11px;height:11px;border-radius:50%;background:var(--text3);top:2px;left:2px;transition:all .28s cubic-bezier(.4,0,.2,1)}
-.toggle.on{background:var(--green);border-color:var(--green);box-shadow:0 0 10px rgba(74,222,128,.3)}
-.toggle.on::after{left:17px;background:#fff}
-.sys-bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}
-.sys-fill{height:100%;border-radius:3px;transition:width .4s}
-.sl-item{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
-.sl-k{color:var(--text3);font-size:11.5px}
-.sl-v{color:var(--text);font-weight:600;font-size:11.5px}
-.fg{display:flex;flex-direction:column;gap:4px;margin-bottom:11px}
-.fl{font-size:9.5px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.08em}
-.fi,.fs{padding:8px 12px;border-radius:8px;border:1px solid var(--border);font-family:inherit;font-size:12.5px;outline:none;color:var(--text);background:var(--surface);transition:all .2s}
-.fi:focus,.fs:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(255,215,0,.08)}
-.fr{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
-.fr .fg{margin-bottom:0;flex:1;min-width:90px}
-.act-btn{font-family:inherit;font-size:9.5px;font-weight:700;border-radius:6px;padding:4px 8px;cursor:pointer;display:inline-flex;align-items:center;gap:3px;border:1px solid;transition:all .18s}
-.act-copy{background:var(--gold-dim);color:var(--gold);border-color:var(--border)}
-.act-sub{background:var(--green-dim);color:var(--green);border-color:rgba(74,222,128,.2)}
-.act-qr{background:rgba(167,139,250,.1);color:#a78bfa;border-color:rgba(167,139,250,.2)}
-.act-edit{background:rgba(251,191,36,.08);color:var(--yellow);border-color:rgba(251,191,36,.2)}
-.act-del{background:var(--red-dim);color:var(--red);border-color:rgba(248,113,113,.18)}
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(16px);background:var(--surface);color:var(--text);border:1px solid var(--border2);border-radius:10px;padding:12px 20px;font-size:13px;font-weight:600;opacity:0;transition:all .3s;z-index:999;backdrop-filter:blur(24px);box-shadow:var(--gold-glow)}
+.toggle{width:38px;height:20px;border-radius:999px;background:rgba(255,255,255,.08);position:relative;cursor:pointer;transition:all .28s;border:1px solid rgba(255,255,255,.15);flex-shrink:0}
+.toggle::after{content:'';position:absolute;width:14px;height:14px;border-radius:50%;background:var(--text3);top:3px;left:3px;transition:all .28s cubic-bezier(.4,0,.2,1)}
+.toggle.on{background:rgba(74,222,128,.22);border-color:rgba(74,222,128,.35);box-shadow:0 0 16px rgba(74,222,128,.18)}
+.toggle.on::after{left:21px;background:#fff}
+.sys-bar{height:7px;background:rgba(255,255,255,.08);border-radius:999px;overflow:hidden}
+.sys-fill{height:100%;border-radius:999px;transition:width .4s}
+.sl-item{display:flex;align-items:center;justify-content:space-between;padding:14px 0;border-bottom:1px solid rgba(255,255,255,.08)}
+.sl-k{color:var(--text3);font-size:12px}
+.sl-v{color:var(--text);font-weight:700;font-size:12px}
+.fg{display:flex;flex-direction:column;gap:6px;margin-bottom:14px}
+.fl{font-size:10px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.1em}
+.fi,.fs{padding:14px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.12);font-family:inherit;font-size:14px;outline:none;color:var(--text);background:rgba(255,255,255,.08);backdrop-filter:blur(16px);transition:all .25s}
+.fi:focus,.fs:focus{border-color:rgba(112,214,255,.5);box-shadow:0 0 0 4px rgba(112,214,255,.1)}
+.fr{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+.fr .fg{margin-bottom:0;flex:1;min-width:110px}
+.act-btn{font-family:inherit;font-size:10.5px;font-weight:700;border-radius:999px;padding:8px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;border:1px solid;transition:all .18s}
+.act-copy{background:rgba(255,209,102,.14);color:var(--gold);border-color:rgba(255,209,102,.2)}
+.act-sub{background:rgba(74,222,128,.14);color:var(--green);border-color:rgba(74,222,128,.2)}
+.act-qr{background:rgba(167,139,250,.16);color:#d8b4fe;border-color:rgba(167,139,250,.24)}
+.act-edit{background:rgba(255,209,102,.12);color:var(--gold);border-color:rgba(255,209,102,.2)}
+.act-del{background:rgba(248,113,113,.14);color:var(--pink);border-color:rgba(248,113,113,.22)}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(18px);background:rgba(15,19,34,0.95);color:var(--text);border:1px solid rgba(255,255,255,.16);border-radius:18px;padding:14px 22px;font-size:13px;font-weight:700;opacity:0;transition:all .3s;z-index:999;backdrop-filter:blur(24px);box-shadow:0 32px 80px rgba(0,0,0,.25)}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-.mo{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(8px)}
+.mo{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(14px)}
 .mo.show{display:flex}
-.mo-box{background:var(--surface2);border:1px solid var(--border2);border-radius:18px;padding:24px;width:100%;max-width:460px;position:relative;box-shadow:var(--gold-glow);transform:scale(.92);opacity:0;transition:all .38s cubic-bezier(.34,1.56,.64,1)}
+.mo-box{background:rgba(9,12,21,0.96);border:1px solid rgba(255,255,255,.16);border-radius:28px;padding:28px;width:100%;max-width:520px;position:relative;box-shadow:0 40px 100px rgba(0,0,0,.35);transform:scale(.94);opacity:0;transition:all .38s cubic-bezier(.34,1.56,.64,1);backdrop-filter:blur(24px)}
 .mo.show .mo-box{transform:scale(1);opacity:1}
-.mo-title{font-family:'Cinzel',serif;font-size:14px;font-weight:700;margin-bottom:16px;color:var(--gold);letter-spacing:.06em}
-.mo-close{position:absolute;top:14px;right:14px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:30px;height:30px;border-radius:7px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px;}
-.qr-box{text-align:center;padding:20px;background:var(--surface3);border-radius:12px;border:1px solid var(--border);margin-top:12px}
-.qr-box img{max-width:200px;border-radius:8px;border:3px solid var(--border);box-shadow:var(--gold-glow)}
-.tb{display:flex;align-items:center;gap:7px;margin-bottom:14px;flex-wrap:wrap}
-.search-wrap{flex:1;min-width:160px;position:relative}
-.search-wrap svg{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--text3)}
-.search-wrap input{width:100%;padding:9px 12px 9px 34px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;font-family:inherit;outline:none;}
-.filter-chips{display:flex;gap:3px;padding:3px;background:var(--surface2);border:1px solid var(--border);border-radius:8px}
-.chip{padding:7px 12px;border-radius:6px;font-size:11.5px;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:none;transition:all .18s;font-family:inherit}
-.chip.active{background:var(--gold);color:#000}
-.m-cards{display:none;flex-direction:column;gap:12px}
-.m-card{border:1px solid var(--border);border-radius:12px;padding:16px;background:var(--surface2)}
-.m-card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
-.m-card-acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
-.empty{text-align:center;padding:36px;color:var(--text3)}
-.mob-hd{display:none;position:fixed;top:0;left:0;right:0;background:var(--surface);border-bottom:1px solid var(--border);z-index:90;align-items:center;justify-content:space-between;backdrop-filter:blur(20px);}
+.mo-title{font-family:'Nunito Sans','Vazirmatn',sans-serif;font-size:14px;font-weight:800;margin-bottom:18px;color:#d8b4ff;letter-spacing:.08em}
+.mo-close{position:absolute;top:16px;right:16px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);color:var(--text3);width:36px;height:36px;border-radius:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px}
+.qr-box{text-align:center;padding:24px;background:rgba(255,255,255,.05);border-radius:20px;border:1px solid rgba(255,255,255,.12);margin-top:14px}
+.qr-box img{max-width:220px;border-radius:18px;border:2px solid rgba(255,255,255,.16);box-shadow:0 30px 70px rgba(0,0,0,.32)}
+.tb{display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+.search-wrap{flex:1;min-width:180px;position:relative}
+.search-wrap svg{position:absolute;left:16px;top:50%;transform:translateY(-50%);color:var(--text3)}
+.search-wrap input{width:100%;padding:14px 16px 14px 42px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);border-radius:18px;color:var(--text);font-size:14px;font-family:inherit;outline:none;backdrop-filter:blur(16px);transition:all .25s}
+.search-wrap input:focus{border-color:rgba(112,214,255,.5);box-shadow:0 0 0 4px rgba(112,214,255,.1)}
+.filter-chips{display:flex;gap:8px;padding:8px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:999px}
+.chip{padding:10px 16px;border-radius:999px;font-size:12px;font-weight:700;color:var(--text3);cursor:pointer;border:none;background:rgba(255,255,255,.06);transition:all .25s;font-family:inherit}
+.chip.active{background:linear-gradient(135deg,rgba(112,214,255,.24),rgba(167,139,250,.22));color:#fff}
+.m-cards{display:none;flex-direction:column;gap:14px}
+.m-card{border:1px solid rgba(255,255,255,.12);border-radius:24px;padding:20px;background:rgba(255,255,255,.05);backdrop-filter:blur(18px)}
+.m-card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.m-card-acts{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+.empty{text-align:center;padding:40px;color:var(--text3)}
+.mob-hd{display:none;position:fixed;top:0;left:0;right:0;background:rgba(9,12,21,.94);border-bottom:1px solid rgba(255,255,255,.08);z-index:90;align-items:center;justify-content:space-between;backdrop-filter:blur(18px);}
 .mob-tl-group{display:flex;gap:10px;align-items:center;flex-direction:row;}
-.logout-mob{display:none;color:var(--red) !important;}
-.logout-mob:hover{background:var(--red-dim) !important;border-color:rgba(248,113,113,.3) !important;}
-
-/* Alerts and Log sections */
-.alerts-box {
-  background: rgba(248, 113, 113, 0.08);
-  border: 1px dashed rgba(248, 113, 113, 0.3);
-  border-radius: 12px;
-  padding: 14px;
-  margin-bottom: 14px;
-  display: none;
-}
-.alerts-title {
-  color: var(--red);
-  font-size: 12.5px;
-  font-weight: 700;
-  margin-bottom: 8px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.alert-item {
-  font-size: 12px;
-  margin-bottom: 4px;
-  color: var(--text);
-  display: flex;
-  justify-content: space-between;
-}
-.live-logs-container {
-  background: #000;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 12px;
-  font-family: monospace;
-  font-size: 11px;
-  color: #4ade80;
-  height: 200px;
-  overflow-y: auto;
-  white-space: pre-wrap;
-}
-
-/* Login page */
+.logout-mob{display:none;color:var(--pink) !important;}
+.logout-mob:hover{background:rgba(248,113,113,.16) !important;border-color:rgba(248,113,113,.3) !important;}
+.alerts-box{background:rgba(248,113,113,.08);border:1px dashed rgba(248,113,113,.28);border-radius:22px;padding:18px;margin-bottom:16px;display:none;backdrop-filter:blur(16px)}
+.alerts-title{color:var(--pink);font-size:12.5px;font-weight:700;margin-bottom:10px;display:flex;align-items:center;gap:10px}
+.alert-item{font-size:12px;margin-bottom:8px;color:var(--text);display:flex;justify-content:space-between}
+.live-logs-container{background:rgba(0,0,0,.28);border:1px solid rgba(255,255,255,.12);border-radius:22px;padding:20px;font-family:monospace;font-size:12px;color:#a5f3fc;height:220px;overflow-y:auto;white-space:pre-wrap;backdrop-filter:blur(16px)}
 .login-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh;width:100%}
-.login-box{background:var(--surface2);border:1px solid var(--border2);border-radius:20px;padding:36px 32px;width:100%;max-width:360px;box-shadow:var(--gold-glow)}
-.login-logo{text-align:center;margin-bottom:28px}
-.login-title{font-family:'Cinzel',serif;font-size:22px;font-weight:900;color:var(--gold);letter-spacing:.1em}
-.login-sub{font-size:11px;color:var(--text3);margin-top:6px}
+.login-box{background:rgba(9,12,21,.94);border:1px solid rgba(255,255,255,.16);border-radius:32px;padding:44px 38px;width:100%;max-width:440px;box-shadow:0 40px 110px rgba(0,0,0,.35)}
+.login-logo{text-align:center;margin-bottom:34px}
+.login-title{font-family:'Nunito Sans','Vazirmatn',sans-serif;font-size:34px;font-weight:900;background:linear-gradient(90deg,#70d6ff,#a855f7);-webkit-background-clip:text;color:transparent;letter-spacing:.14em}
+.login-sub{font-size:13px;color:var(--text3);margin-top:12px}
 @media(max-width:768px){
-  .mob-hd{display:flex;height:65px;padding:0 20px;}
-  .mob-tl-group .lang-btn{font-size:13px;padding:7px 10px;border-radius:8px;}
-  .theme-toggle{font-size:18px;padding:7px 10px;border-radius:8px;}
-  .mob-hd span{font-size:22px !important;}
-  .sidebar{transform:none !important;width:100% !important;height:78px;top:auto;bottom:0;border-right:none;border-top:1px solid var(--border);flex-direction:row;padding:0;background:var(--surface);box-shadow:0 -4px 20px rgba(0,0,0,0.5);}
-  .light-mode .sidebar{box-shadow:0 -4px 20px rgba(0,0,0,0.06);}
+  .mob-hd{display:flex;height:78px;padding:0 20px;}
+  .mob-tl-group .lang-btn{font-size:13px;padding:7px 12px;border-radius:999px;}
+  .theme-toggle{font-size:16px;padding:8px 12px;border-radius:999px;}
+  .mob-hd span{font-size:18px !important;}
+  .sidebar{transform:none !important;width:100% !important;height:88px;top:auto;bottom:0;border-right:none;border-top:1px solid rgba(255,255,255,.08);flex-direction:row;padding:0;background:rgba(9,12,21,.96);box-shadow:0 -15px 40px rgba(0,0,0,.3);}
+  .light-mode .sidebar{box-shadow:0 -4px 18px rgba(0,0,0,0.08);}
   .sb-brand,.sb-bottom{display:none !important;}
   .sb-nav{flex-direction:row;width:100%;padding:0;align-items:center;justify-content:space-between;gap:0;}
-  .nav-item{flex:1;padding:12px 0;border-radius:0;}
+  .nav-item{flex:1;padding:16px 0;border-radius:0;}
   .nav-icon{width:24px;height:24px;margin-bottom:5px;}
   .nav-label{font-size:10px;letter-spacing:0;}
-  .nav-badge{top:6px;right:50%;transform:translateX(10px);min-width:18px;height:18px;font-size:10px;}
+  .nav-badge{top:8px;right:50%;transform:translateX(10px);min-width:18px;height:18px;font-size:10px;}
   .logout-mob{display:flex;}
-  .main{margin-left:0;padding-top:85px;padding-left:18px;padding-right:18px;padding-bottom:100px;}
+  .main{margin-left:0;padding-top:100px;padding-left:18px;padding-right:18px;padding-bottom:112px;}
   .page-title{font-size:24px;}
   .page-sub{font-size:13px;margin-top:5px;}
-  .btn{font-size:14px;padding:10px 18px;}
-  .btn-sm{font-size:12px;padding:8px 14px;}
-  .stats-row{grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px;}
-  .stat-card{padding:22px;border-radius:16px;}
+  .btn{font-size:14px;padding:12px 18px;}
+  .btn-sm{font-size:12px;padding:10px 16px;}
+  .stats-row{grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px;}
+  .stat-card{padding:24px;border-radius:24px;}
   .stat-label{font-size:12px;margin-bottom:12px;}
-  .stat-val{font-size:26px;}
+  .stat-val{font-size:28px;}
   .stat-unit{font-size:14px;}
-  .grid-2{grid-template-columns:1fr;gap:14px;margin-bottom:14px;}
-  .card{padding:22px;border-radius:16px;margin-bottom:14px;}
+  .grid-2{grid-template-columns:1fr;gap:16px;margin-bottom:16px;}
+  .card{padding:24px;border-radius:26px;margin-bottom:18px;}
   .card-title{font-size:16px;margin-bottom:16px;}
-  .chart-container{height:220px;width:100%}
+  .chart-container{height:240px;width:100%}
   #cpu-v,#mem-v{font-size:22px !important;}
-  .sl-k,.sl-v{font-size:14px;padding:14px 0;}
+  .sl-k,.sl-v{font-size:14px;padding:16px 0;}
   .tbl-wrap{display:none}
   .m-cards{display:flex;}
-  .m-card{padding:18px;border-radius:14px;}
+  .m-card{padding:20px;border-radius:24px;}
   .m-card-hd span{font-size:16px !important;}
   .pill-used{font-size:13px;}
   .pill-lim{font-size:12px;}
-  .m-card-acts .act-btn{font-size:12px;padding:8px 14px;border-radius:8px;}
-  .mo-box{padding:28px 24px;border-radius:20px;}
-  .fi,.fs{font-size:16px;padding:12px 16px;}
+  .m-card-acts .act-btn{font-size:12px;padding:10px 16px;border-radius:999px;}
+  .mo-box{padding:30px 26px;border-radius:32px;}
+  .fi,.fs{font-size:15px;padding:16px 18px;}
   .fl{font-size:11px;margin-bottom:6px;}
 }
-@media(max-width:460px){.stats-row{grid-template-columns:1fr;gap:14px;}}
+@media(max-width:460px){.stats-row{grid-template-columns:1fr;gap:16px;}}
 </style>
 </head>
 <body>
@@ -1941,14 +2108,10 @@ body[dir="rtl"]{direction:rtl;text-align:right}
   <div class="login-wrap">
     <div class="login-box">
       <div class="login-logo">
-        <svg width="52" height="44" viewBox="0 0 84 68" fill="none">
-          <ellipse cx="42" cy="52" rx="40" ry="11" fill="#C8900A" opacity=".85"/>
-          <ellipse cx="42" cy="52" rx="40" ry="11" fill="none" stroke="#FFD700" stroke-width="1.4" opacity=".6"/>
-          <path d="M19 50 Q21 22 42 17 Q63 22 65 50" fill="#D4960C" stroke="#FFD700" stroke-width="1.4"/>
-          <ellipse cx="42" cy="17" rx="23" ry="5.5" fill="#C8900A" stroke="#FFD700" stroke-width="1"/>
-          <path d="M20 45 Q21.5 41.5 42 39.5 Q62.5 41.5 64 45" fill="none" stroke="#CC2200" stroke-width="4.5" stroke-linecap="round" opacity=".92"/>
+        <svg xmlns="http://www.w3.org/2000/svg" height="52px" viewBox="0 -960 960 960" width="52px" fill="#FFD700">
+          <path d="M280-240q-100 0-170-70T40-480q0-100 70-170t170-70q66 0 121 33t87 87h432v240h-80v120H600v-120H488q-32 54-87 87t-121 33Zm0-80q66 0 106-40.5t48-79.5h246v120h80v-120h80v-80H434q-8-39-48-79.5T280-640q-66 0-113 47t-47 113q0 66 47 113t113 47Zm0-80q33 0 56.5-23.5T360-480q0-33-23.5-56.5T280-560q-33 0-56.5 23.5T200-480q0 33 23.5 56.5T280-400Zm0-80Z"/>
         </svg>
-        <div class="login-title">LUFFY PANEL</div>
+        <div class="login-title">sLv PANEL</div>
         <div class="login-sub">Enter your password to continue</div>
       </div>
       <div class="fg">
@@ -1973,23 +2136,18 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <button class="lang-btn lang-fa" onclick="setLang('fa')">FA</button>
       </div>
     </div>
-    <span style="font-family:'Cinzel',serif;font-size:16px;font-weight:700;color:var(--gold);letter-spacing:1px;">LUFFY</span>
+    <span style="font-family:'Nunito Sans','Vazirmatn',sans-serif;font-size:16px;font-weight:700;color:var(--gold);letter-spacing:1px;">sLv</span>
   </div>
 
   <!-- SIDEBAR -->
   <aside class="sidebar" id="sb">
     <div class="sb-brand">
       <div class="sb-hat">
-        <svg width="36" height="30" viewBox="0 0 84 68" fill="none">
-          <ellipse cx="42" cy="52" rx="40" ry="11" fill="#C8900A" opacity=".85"/>
-          <ellipse cx="42" cy="52" rx="40" ry="11" fill="none" stroke="#FFD700" stroke-width="1.4" opacity=".6"/>
-          <path d="M19 50 Q21 22 42 17 Q63 22 65 50" fill="#D4960C" stroke="#FFD700" stroke-width="1.4"/>
-          <ellipse cx="42" cy="17" rx="23" ry="5.5" fill="#C8900A" stroke="#FFD700" stroke-width="1"/>
-          <path d="M20 45 Q21.5 41.5 42 39.5 Q62.5 41.5 64 45" fill="none" stroke="#CC2200" stroke-width="4.5" stroke-linecap="round" opacity=".92"/>
-          <ellipse cx="35" cy="24" rx="5" ry="3" fill="rgba(255,255,255,.1)" transform="rotate(-20 35 24)"/>
+        <svg xmlns="http://www.w3.org/2000/svg" height="36px" viewBox="0 -960 960 960" width="36px" fill="#FFD700">
+          <path d="M280-240q-100 0-170-70T40-480q0-100 70-170t170-70q66 0 121 33t87 87h432v240h-80v120H600v-120H488q-32 54-87 87t-121 33Zm0-80q66 0 106-40.5t48-79.5h246v120h80v-120h80v-80H434q-8-39-48-79.5T280-640q-66 0-113 47t-47 113q0 66 47 113t113 47Zm0-80q33 0 56.5-23.5T360-480q0-33-23.5-56.5T280-560q-33 0-56.5 23.5T200-480q0 33 23.5 56.5T280-400Zm0-80Z"/>
         </svg>
       </div>
-      <div class="sb-title">LUFFY</div>
+      <div class="sb-title">sLv</div>
     </div>
     <nav class="sb-nav">
       <button class="nav-item active" data-page="dashboard">
@@ -2180,10 +2338,17 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     <div class="fg"><label class="fl" data-en="Remark" data-fa="توضیح">Remark</label><input class="fi" id="nl" data-ph-en="e.g. User 1" data-ph-fa="مثلاً کاربر ۱" placeholder="e.g. User 1"></div>
     <div class="fr">
       <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="nv" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu"><option>GB</option></select></div>
+      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu"><option>GB</option><option>MB</option><option>KB</option></select></div>
+    </div>
+    <div class="fr">
+      <div class="fg"><label class="fl" data-en="Daily Limit" data-fa="محدودیت روزانه">Daily Limit</label><input class="fi" id="ndv" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="ndu"><option>GB</option><option>MB</option><option>KB</option></select></div>
+    </div>
+    <div class="fr">
+      <div class="fg"><label class="fl" data-en="Expiry" data-fa="انقضا">Expiry</label><input class="fi" id="ne" type="number" min="0" step="1" data-ph-en="0 = No expiry" data-ph-fa="۰ = بدون انقضا" placeholder="0 = No expiry"></div>
+      <div class="fg" style="max-width:120px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="nu2"><option value="days">Days</option><option value="hours">Hours</option><option value="minutes">Minutes</option></select></div>
     </div>
     <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="nc" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-    <div class="fg"><label class="fl" data-en="Days Valid" data-fa="روزهای اعتبار">Days Valid</label><input class="fi" id="nd" type="number" min="0" data-ph-en="0 = No expiry" data-ph-fa="۰ = بدون انقضا" placeholder="0 = No expiry"></div>
     <button class="btn btn-gold" onclick="createLink()" style="width:100%;justify-content:center;margin-top:12px;padding:12px;" data-en="CREATE" data-fa="ایجاد">CREATE</button>
   </div>
 </div>
@@ -2196,10 +2361,17 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     <div class="fg"><label class="fl" data-en="Name" data-fa="نام">Name</label><input class="fi" id="en2" readonly style="opacity:.5;cursor:not-allowed"></div>
     <div class="fr">
       <div class="fg"><label class="fl" data-en="Traffic Limit" data-fa="محدودیت ترافیک">Traffic Limit</label><input class="fi" id="el" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="eu2"><option>GB</option></select></div>
+      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="eu2"><option>GB</option><option>MB</option><option>KB</option></select></div>
+    </div>
+    <div class="fr">
+      <div class="fg"><label class="fl" data-en="Daily Limit" data-fa="محدودیت روزانه">Daily Limit</label><input class="fi" id="edv" type="number" min="0" step=".1" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
+      <div class="fg" style="max-width:100px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="edu2"><option>GB</option><option>MB</option><option>KB</option></select></div>
+    </div>
+    <div class="fr">
+      <div class="fg"><label class="fl" data-en="Extend" data-fa="افزایش">Extend</label><input class="fi" id="ed" type="number" min="0" step="1" data-ph-en="0 = no change" data-ph-fa="۰ = بدون تغییر" placeholder="0 = no change"></div>
+      <div class="fg" style="max-width:120px"><label class="fl" data-en="Unit" data-fa="واحد">Unit</label><select class="fs" id="eu3"><option value="days">Days</option><option value="hours">Hours</option><option value="minutes">Minutes</option></select></div>
     </div>
     <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="ec" type="number" min="0" data-ph-en="0 = ∞" data-ph-fa="۰ = نامحدود" placeholder="0 = ∞"></div>
-    <div class="fg"><label class="fl" data-en="Extend Days" data-fa="افزایش روزها">Extend Days</label><input class="fi" id="ed" type="number" min="0" data-ph-en="0 = no change" data-ph-fa="۰ = بدون تغییر" placeholder="0 = no change"></div>
     <div style="display:flex;gap:10px;margin-top:16px">
       <button class="btn btn-gold" onclick="saveEdit()" style="flex:1;justify-content:center;padding:12px;" data-en="SAVE" data-fa="ذخیره">SAVE</button>
       <button class="btn btn-danger" onclick="resetTraf()" style="padding:12px;" data-en="Reset" data-fa="بازنشانی ترافیک">Reset</button>
@@ -2567,17 +2739,30 @@ async function createLink(){
   const label=$m('nl').value.trim()||'New Link';
   if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Only English letters allowed',true);return;}
   const v=parseFloat($m('nv').value)||0;
+  const limitUnit=$m('nu').value||'GB';
+  const dailyValue=parseFloat($m('ndv').value)||0;
+  const dailyUnit=$m('ndu').value||'GB';
+  const expiryValue=parseFloat($m('ne').value)||0;
+  const expiryUnit=$m('nu2').value||'days';
   const mc=parseInt($m('nc').value)||0;
-  const days=parseInt($m('nd').value)||0;
   try{
     const r=await fetch('/api/links',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})
+      body:JSON.stringify({
+        label,
+        limit_value:v,
+        limit_unit:limitUnit,
+        daily_limit_value:dailyValue,
+        daily_limit_unit:dailyUnit,
+        expiry_value:expiryValue,
+        expiry_unit:expiryUnit,
+        max_connections:mc
+      })
     });
     if(!r.ok)throw new Error();
     toast('Created');
-    $m('nl').value='';$m('nv').value='';$m('nc').value='';$m('nd').value='';
+    $m('nl').value='';$m('nv').value='';$m('ndv').value='';$m('nc').value='';$m('ne').value='';
     $m('mo-add').classList.remove('show');
     await loadLinks();
     await loadStats();
@@ -2590,19 +2775,49 @@ function showEditMo(uid){
   $m('eu').value=uid;
   $m('en2').value=l.label;
   $m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';
+  $m('eu2').value='GB';
+  $m('edv').value=l.daily_limit_bytes>0?(l.daily_limit_bytes/1073741824):'';
+  $m('edu2').value='GB';
   $m('ec').value=l.max_connections>0?l.max_connections:'';
   $m('ed').value='';
+  $m('eu3').value='days';
   $m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;
   $m('mo-edit').classList.add('show');
 }
 
 async function saveEdit(){
   const uid=$m('eu').value;
-  const v=parseFloat($m('el').value)||0;
-  const mc=parseInt($m('ec').value)||0;
-  const days=parseInt($m('ed').value)||0;
-  const body={limit_value:v,limit_unit:'GB',max_connections:mc};
-  if(days>0)body.days_valid=days;
+  const vRaw=$m('el').value;
+  const v=parseFloat(vRaw);
+  const limitUnit=$m('eu2').value||'GB';
+  const dailyRaw=$m('edv').value;
+  const dailyValue=parseFloat(dailyRaw);
+  const dailyUnit=$m('edu2').value||'GB';
+  const expiryRaw=$m('ed').value;
+  const expiryValue=parseFloat(expiryRaw);
+  const expiryUnit=$m('eu3').value||'days';
+  const mcRaw=$m('ec').value;
+  const mc=parseInt(mcRaw);
+  const body={};
+  if(vRaw !== '' && !Number.isNaN(v)){
+    body.limit_value=v;
+    body.limit_unit=limitUnit;
+  }
+  if(dailyRaw !== '' && !Number.isNaN(dailyValue)){
+    body.daily_limit_value=dailyValue;
+    body.daily_limit_unit=dailyUnit;
+  }
+  if(expiryRaw !== '' && !Number.isNaN(expiryValue)){
+    body.expiry_value=expiryValue;
+    body.expiry_unit=expiryUnit;
+  }
+  if(mcRaw !== '' && !Number.isNaN(mc)){
+    body.max_connections=mc;
+  }
+  if(Object.keys(body).length === 0){
+    toast('No changes to save', true);
+    return;
+  }
   try{
     const r=await fetch('/api/links/'+uid,{
       method:'PATCH',
@@ -2618,12 +2833,12 @@ async function saveEdit(){
 
 async function resetTraf(){
   const uid=$m('eu').value;
-  if(!confirm('Reset traffic for this inbound?'))return;
+  if(!confirm('Reset all traffic counters for this inbound?'))return;
   try{
     const r=await fetch('/api/links/'+uid,{
       method:'PATCH',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({reset_usage:true})
+      body:JSON.stringify({reset_usage:true,reset_daily_usage:true})
     });
     if(!r.ok)throw new Error();
     toast('Traffic reset');
@@ -2663,7 +2878,7 @@ function showQR(txt){
 function dlQR(){
   const a=document.createElement('a');
   a.href=$m('qr-img').src;
-  a.download='luffy-qr.png';
+  a.download='sLv-qr.png';
   a.click();
 }
 
@@ -2918,4 +3133,4 @@ async def panel_page(request: Request):
     return HTMLResponse(content=PANEL_HTML)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=CONFIG["port"])
+    uvicorn.run(app, host="0.0.0.0+", port=CONFIG["port"])
